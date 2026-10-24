@@ -1,0 +1,13 @@
+id,subject,title,type,effort_hours,deadline,start,fixed,max_shift_days
+M1,Mathematics,Assignment 3,assignment,8,2026-10-30,,,
+M2,Mathematics,Quiz 2,quiz,3,2026-10-29,,,
+P1,Physics,Lab Report 4,lab,6,2026-10-30,,,
+P2,Physics,Tutorial Sheet 5,tutorial,4,2026-10-29,,,
+C1,Computer Science,Mini Project,project,20,2026-10-30,,,
+C2,Computer Science,Assignment 2,assignment,7,2026-11-02,,,
+E1,Electronics,Assignment 4,assignment,8,2026-10-30,,,
+E2,Electronics,Tutorial 6,tutorial,3,2026-10-31,,,
+H1,Humanities,Essay,assignment,6,2026-11-03,,,
+H2,Humanities,Presentation Prep,project,10,2026-11-06,,,
+M3,Mathematics,Tutorial 7,tutorial,3,2026-11-05,,,
+P3,Physics,Assignment 6,assignment,6,2026-11-09,,,
