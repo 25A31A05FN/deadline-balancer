@@ -6,13 +6,23 @@ import streamlit as st
 from app_logic import (PRESETS, chart_png, changes_df, df_to_tasks, fairness_df, parse_holidays,
                        report_pdf, sample_df, summary, weekly_df)
 from deadline_balancer import Config, balance, make_chart
-from extract import TYPES, read_tasks
+from extract import COLUMNS, TYPES, read_tasks
+from study_features import (PRIORITY_VALUES, add_priority_columns, build_timetable,
+                            deadline_alerts, exam_preparation_plan, make_ics,
+                            progress_summary, study_recommendations)
 
 st.set_page_config(page_title="Deadline Balancer", page_icon="📅", layout="wide")
 
 
 def _start_balancing():
     st.session_state["run"] = True
+
+
+def _append_task(row):
+    current = st.session_state.get("tasks", pd.DataFrame(columns=COLUMNS))
+    current = add_priority_columns(current, today)
+    st.session_state["tasks"] = pd.concat([current, pd.DataFrame([row])], ignore_index=True)
+    st.session_state["editor_v"] += 1
 
 
 # ------------------------------------------------------------------ sidebar
@@ -69,21 +79,44 @@ with right:
 
 # ------------------------------------------------------------------ step 1: tasks
 st.subheader("1 · Your tasks")
-st.session_state.setdefault("tasks", sample_df(today))
+st.session_state.setdefault("tasks", add_priority_columns(sample_df(today), today))
 st.session_state.setdefault("editor_v", 0)
 st.session_state.setdefault("seen_file", None)
 
+# Manual task entry is additive; the original editable table remains available below.
+with st.expander("➕ Add a task manually", expanded=False):
+    with st.form("manual_task_form", clear_on_submit=True):
+        mc1, mc2 = st.columns(2)
+        subject = mc1.text_input("Subject", placeholder="Mathematics")
+        title = mc2.text_input("Task title", placeholder="Assignment 3")
+        mc3, mc4, mc5 = st.columns(3)
+        kind = mc3.selectbox("Task type", TYPES)
+        effort = mc4.number_input("Estimated hours", min_value=0.5, max_value=200.0, value=4.0, step=0.5)
+        due = mc5.date_input("Due date", value=today + timedelta(days=7))
+        mc6, mc7 = st.columns(2)
+        priority = mc6.selectbox("Priority", PRIORITY_VALUES, index=1)
+        fixed = mc7.checkbox("Deadline cannot move", value=kind in ("quiz", "exam"))
+        add_clicked = st.form_submit_button("Add task", type="primary")
+        if add_clicked:
+            if not title.strip():
+                st.error("Enter a task title before adding it.")
+            else:
+                _append_task({"subject": subject.strip() or "General", "title": title.strip(),
+                              "type": kind, "effort_hours": effort, "deadline": due,
+                              "start": None, "fixed": fixed, "max_shift_days": None,
+                              "priority": priority, "completed_hours": 0.0, "status": "Not started"})
+                st.success("Task added. You can edit it in the task table below.")
+
 up = st.file_uploader(
-    "Upload your task list — CSV, PNG/JPG screenshot, or PDF",
-    type=["csv", "png", "jpg", "jpeg", "pdf"],
-    help="A table with a due-date column works best. Screenshots and scanned PDFs are read "
-         "automatically, but please double-check the result.")
+    "Upload your task list — CSV, DOCX, PDF, PNG/JPG/WEBP, or TXT/MD",
+    type=["csv", "docx", "pdf", "png", "jpg", "jpeg", "webp", "txt", "md"],
+    help="Imports are processed locally. Tables and dated task lines are supported; OCR is used for images and scanned PDFs. Review the extracted rows.")
 if up is not None and st.session_state["seen_file"] != up.file_id:
     st.session_state["seen_file"] = up.file_id
     try:
         with st.spinner("Reading your file…"):
             df, notes = read_tasks(up.getvalue(), up.name, today)
-        st.session_state["tasks"] = df
+        st.session_state["tasks"] = add_priority_columns(df, today)
         st.session_state["editor_v"] += 1
         st.session_state["notes"] = (f"Found {len(df)} task(s) in {up.name}.", notes)
     except ValueError as e:
@@ -104,7 +137,7 @@ if c1.button("Use sample tasks", help="Replace the table with example tasks"):
     st.session_state["notes"] = None
     st.rerun()
 c2.caption("Double-click a cell to edit. Use the ＋ row at the bottom to add a task. "
-           "Quizzes and exams never move.")
+           "Track priority and completed hours here. Quizzes and exams never move.")
 
 edited = st.data_editor(
     st.session_state["tasks"],
@@ -112,7 +145,7 @@ edited = st.data_editor(
     num_rows="dynamic",
     width="stretch",
     hide_index=True,
-    column_order=["subject", "title", "type", "effort_hours", "deadline", "fixed", "start", "max_shift_days"],
+    column_order=["subject", "title", "type", "effort_hours", "deadline", "priority", "completed_hours", "status", "fixed", "start", "max_shift_days"],
     column_config={
         "subject": st.column_config.TextColumn("Subject"),
         "title": st.column_config.TextColumn("Task"),
@@ -121,6 +154,9 @@ edited = st.data_editor(
             "Hours of work", min_value=0.5, max_value=200.0, step=0.5, default=4.0,
             help="Your estimate of the total time this will take."),
         "deadline": st.column_config.DateColumn("Due date", format="DD MMM YYYY"),
+        "priority": st.column_config.SelectboxColumn("Priority", options=PRIORITY_VALUES, default="Medium"),
+        "completed_hours": st.column_config.NumberColumn("Completed hours", min_value=0.0, max_value=200.0, step=0.5, default=0.0),
+        "status": st.column_config.SelectboxColumn("Progress", options=["Not started", "In progress", "Completed"], default="Not started"),
         "fixed": st.column_config.CheckboxColumn(
             "Can't move", default=False, help="Tick if this deadline is not negotiable."),
         "start": st.column_config.DateColumn(
@@ -131,6 +167,57 @@ edited = st.data_editor(
             help="Optional. The most this deadline may be pushed back."),
     },
 )
+
+# ------------------------------------------------------------------ progress, alerts and study tools
+# These additions use the existing task table; the deadline-balancing engine below is untouched.
+feature_tasks = add_priority_columns(edited, today)
+st.session_state["tasks"] = feature_tasks
+progress = progress_summary(feature_tasks)
+
+st.subheader("Study progress and alerts")
+p1, p2, p3 = st.columns(3)
+p1.metric("Overall progress", f"{progress['percent']:.1f}%")
+p2.metric("Completed tasks", f"{progress['done']} / {progress['total']}")
+p3.metric("Hours remaining", f"{max(progress['planned'] - progress['completed'], 0):.1f} h")
+st.progress(min(progress["percent"] / 100, 1.0))
+
+alerts = deadline_alerts(feature_tasks, today, 7)
+if alerts.empty:
+    st.success("No unfinished tasks are due in the next 7 days.")
+else:
+    st.warning("Upcoming deadlines — review these tasks.")
+    st.dataframe(alerts, hide_index=True, width="stretch")
+
+with st.expander("📚 Automatic timetable and personalized recommendations", expanded=False):
+    timetable = build_timetable(feature_tasks, today, weekday, weekend, 21)
+    if timetable.empty:
+        st.info("Add tasks with future due dates and remaining hours to generate a timetable.")
+    else:
+        st.dataframe(timetable, hide_index=True, width="stretch")
+        st.download_button("Download timetable CSV", timetable.to_csv(index=False).encode("utf-8"),
+                           "study_timetable.csv", "text/csv")
+        st.download_button("Add timetable to calendar (.ics)", make_ics(timetable).encode("utf-8"),
+                           "study_timetable.ics", "text/calendar")
+    st.markdown("**Study recommendations**")
+    for tip in study_recommendations(feature_tasks, today):
+        st.write("• " + tip)
+
+with st.expander("📝 Exam preparation mode", expanded=False):
+    ec1, ec2 = st.columns(2)
+    exam_subject = ec1.text_input("Exam subject", key="exam_subject")
+    exam_date = ec2.date_input("Exam date", value=today + timedelta(days=14), key="exam_date")
+    exam_hours = st.number_input("Study hours per day", min_value=0.5, max_value=12.0, value=2.0, step=0.5)
+    topics_text = st.text_area("Enter syllabus topics (one topic per line)", placeholder="Unit 1 - Basics\nUnit 2 - Applications")
+    if st.button("Generate exam preparation plan"):
+        topics = [line.strip() for line in topics_text.splitlines() if line.strip()]
+        if exam_date < today:
+            st.error("Choose an exam date today or in the future.")
+        else:
+            exam_plan = exam_preparation_plan(exam_subject.strip() or "Exam", exam_date,
+                                              exam_hours, today, topics)
+            st.dataframe(exam_plan, hide_index=True, width="stretch")
+            st.download_button("Download exam plan CSV", exam_plan.to_csv(index=False).encode("utf-8"),
+                               "exam_preparation_plan.csv", "text/csv")
 
 # ------------------------------------------------------------------ step 2: results
 st.subheader("2 · Results")
