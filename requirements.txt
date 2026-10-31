@@ -1,8 +1,9 @@
 streamlit
 pandas
 matplotlib
-pillow
+Pillow
 pdfplumber
 pypdfium2
 pytesseract
 pyarrow<25
+python-docx
