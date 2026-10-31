@@ -1,1 +1,8 @@
-
+streamlit
+pandas
+matplotlib
+pillow
+pdfplumber
+pypdfium2
+pytesseract
+pyarrow<25
