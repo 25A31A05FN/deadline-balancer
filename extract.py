@@ -227,50 +227,158 @@ def _read_image(data: bytes, today: date):
 
 
 def _read_pdf(data: bytes, today: date):
+    """Read digital or scanned PDFs, with OCR fallback when text parsing fails."""
     import pdfplumber
+
     notes: List[str] = []
-    frames, text_parts = [], []
-    with pdfplumber.open(io.BytesIO(data)) as pdf:
-        for page in pdf.pages:
-            for tbl in page.extract_tables():
-                if tbl and len(tbl) > 1:
-                    t = pd.DataFrame(tbl[1:], columns=[str(c or "").strip() for c in tbl[0]])
-                    if "deadline" in _normalise_headers(t).columns:
-                        frames.append(t)
-            text_parts.append(page.extract_text() or "")
-    if frames:
-        df, n = _finish(pd.concat(frames, ignore_index=True), today)
-        return df, n
-    text = "\n".join(text_parts)
-    if len(text.strip()) < 20:                 # scanned PDF -> OCR
+    table_frames = []
+    page_text = []
+    try:
+        with pdfplumber.open(io.BytesIO(data)) as pdf:
+            for page in pdf.pages:
+                # Try common table layouts. Header matching is normalized so
+                # variants such as "Due Date" and "Estimated Hours" work.
+                try:
+                    tables = page.extract_tables(
+                        table_settings={"vertical_strategy": "lines", "horizontal_strategy": "lines"}
+                    ) or []
+                    if not tables:
+                        tables = page.extract_tables() or []
+                except Exception:
+                    tables = page.extract_tables() or []
+
+                for table in tables:
+                    if not table or len(table) < 2:
+                        continue
+                    header = [str(cell or "").replace("\n", " ").strip() for cell in table[0]]
+                    frame = pd.DataFrame(table[1:], columns=header)
+                    normalized = _normalise_headers(frame)
+                    if "deadline" in normalized.columns:
+                        table_frames.append(frame)
+                page_text.append(page.extract_text(layout=True) or page.extract_text() or "")
+    except Exception as exc:
+        raise ValueError(f"Couldn't open this PDF ({exc}).")
+
+    # Structured tables are more reliable than free-text parsing.
+    if table_frames:
+        combined = pd.concat(table_frames, ignore_index=True)
         try:
-            import pypdfium2 as pdfium
-            doc = pdfium.PdfDocument(data)
-            text = "\n".join(_ocr_image(doc[i].render(scale=2.5).to_pil()) for i in range(len(doc)))
-            notes.append("This PDF is a scan, so it was read with OCR - please check the table.")
-        except Exception as e:
-            raise ValueError(f"Couldn't read this PDF ({e}).")
-    df, n = parse_text(text, today)
-    return df, notes + n
+            df, table_notes = _finish(combined, today)
+            if not df.empty:
+                return df, table_notes
+        except ValueError:
+            pass
+
+    text = "\n".join(page_text)
+    df, parse_notes = parse_text(text, today) if text.strip() else (pd.DataFrame(columns=COLUMNS), [])
+    if not df.empty:
+        return df, notes + parse_notes
+
+    # OCR is also attempted for PDFs that contain selectable text but whose
+    # layout/parser did not identify any task rows.
+    try:
+        import pypdfium2 as pdfium
+        document = pdfium.PdfDocument(data)
+        ocr_pages = []
+        for index in range(len(document)):
+            page_image = document[index].render(scale=3.0).to_pil()
+            ocr_pages.append(_ocr_image(page_image))
+        ocr_text = "\n".join(ocr_pages)
+        ocr_df, ocr_notes = parse_text(ocr_text, today)
+        if not ocr_df.empty:
+            notes.append("PDF text extraction found no task rows, so OCR was used. Please verify dates and hours.")
+            return ocr_df, notes + ocr_notes
+    except Exception as exc:
+        if not text.strip():
+            raise ValueError(f"Couldn't read this PDF. If it is scanned, ensure Tesseract OCR is installed. Details: {exc}")
+
+    raise ValueError(
+        "No tasks were detected in this PDF. Use one task per line or a table with columns "
+        "such as Subject, Task, Hours and Due Date. Example: Maths | Assignment 3 | 8 hrs | 30 Oct 2026."
+    )
+
+
+def _read_docx(data: bytes, today: date) -> Tuple[pd.DataFrame, List[str]]:
+    """Read Word paragraphs and tables without sending data to an online service."""
+    try:
+        from docx import Document
+        doc = Document(io.BytesIO(data))
+    except Exception as exc:
+        raise ValueError(f"Couldn't read this DOCX file ({exc}). Install python-docx.")
+
+    notes: List[str] = []
+    frames = []
+    for table in doc.tables:
+        values = [[cell.text.strip().replace("\n", " ") for cell in row.cells]
+                  for row in table.rows]
+        if len(values) >= 2 and any(values[0]):
+            frame = pd.DataFrame(values[1:], columns=values[0])
+            if "deadline" in _normalise_headers(frame).columns:
+                frames.append(frame)
+    if frames:
+        try:
+            result, table_notes = _finish(pd.concat(frames, ignore_index=True), today)
+            if not result.empty:
+                return result, table_notes
+        except (ValueError, KeyError):
+            pass
+
+    # Paragraphs plus table rows as text: supports ordinary Word task lists.
+    lines = [p.text for p in doc.paragraphs if p.text.strip()]
+    for table in doc.tables:
+        for row in table.rows:
+            lines.append(" | ".join(cell.text.strip().replace("\n", " ") for cell in row.cells))
+    result, text_notes = parse_text("\n".join(lines), today)
+    if not result.empty:
+        notes.append("Read from a Word document. Please review the extracted task names and dates.")
+        return result, notes + text_notes
+    raise ValueError("No tasks were detected in this DOCX. Add a due date to each task or use a table with Subject, Task, Hours and Due Date columns.")
+
+
+def _read_csv(data: bytes, today: date) -> Tuple[pd.DataFrame, List[str]]:
+    """Read CSV with common encodings/delimiters; fall back to free-text rows."""
+    last_error = None
+    for encoding in ("utf-8-sig", "utf-8", "cp1252", "latin-1"):
+        try:
+            raw = data.decode(encoding)
+            frame = pd.read_csv(io.StringIO(raw), dtype=str, sep=None, engine="python",
+                                skipinitialspace=True)
+            if len(frame.columns) > 1 and "deadline" in _normalise_headers(frame).columns:
+                return _finish(frame, today)
+            # Some exported CSVs are actually one task per line with no header.
+            parsed, notes = parse_text(raw, today)
+            if not parsed.empty:
+                return parsed, ["CSV had no recognized column headers; interpreted each dated row as a task."] + notes
+            return _finish(frame, today)
+        except Exception as exc:
+            last_error = exc
+    raise ValueError(f"Couldn't read the CSV ({last_error}).")
 
 
 def read_tasks(data: bytes, filename: str, today: date) -> Tuple[pd.DataFrame, List[str]]:
-    """Main entry point. Raises ValueError with a friendly message on failure."""
+    """Convert supported offline files into the exact DataFrame schema used by the app.
+
+    Supported: CSV, DOCX, PDF, PNG, JPG/JPEG, WEBP and TXT. No external LLM/API is used.
+    """
     ext = filename.lower().rsplit(".", 1)[-1] if "." in filename else ""
     if ext == "csv":
-        try:
-            df = pd.read_csv(io.BytesIO(data), dtype=str, skipinitialspace=True)
-        except Exception as e:
-            raise ValueError(f"Couldn't read the CSV ({e}).")
-        df, notes = _finish(df, today)
+        df, notes = _read_csv(data, today)
     elif ext in ("png", "jpg", "jpeg", "webp"):
         df, notes = _read_image(data, today)
     elif ext == "pdf":
         df, notes = _read_pdf(data, today)
+    elif ext == "docx":
+        df, notes = _read_docx(data, today)
+    elif ext in ("txt", "md"):
+        try:
+            raw = data.decode("utf-8-sig")
+        except UnicodeDecodeError:
+            raw = data.decode("cp1252", errors="replace")
+        df, notes = parse_text(raw, today)
     else:
-        raise ValueError("Please upload a CSV, PNG, JPG or PDF file.")
+        raise ValueError("Supported formats: CSV, DOCX, PDF, PNG, JPG/JPEG, WEBP and TXT.")
     if df.empty:
-        raise ValueError("We couldn't find any tasks with a due date in that file. "
-                         "Each task should be on its own line with a date, e.g. "
-                         "\"Maths | Assignment 3 | 8 hrs | 30 Oct 2026\".")
-    return df, notes
+        raise ValueError("No tasks with readable due dates were found. Add a due date to each task. "
+                         "Example: Maths | Assignment 3 | 8 hrs | 30 Oct 2026.")
+    # Always return only the app's canonical columns in canonical order.
+    return df[COLUMNS].reset_index(drop=True), notes
