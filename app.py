@@ -1,287 +1,982 @@
-from datetime import date, timedelta
 
+from datetime import date, timedelta
 import pandas as pd
 import streamlit as st
 
-from app_logic import (PRESETS, chart_png, changes_df, df_to_tasks, fairness_df, parse_holidays,
-                       report_pdf, sample_df, summary, weekly_df)
+from app_logic import (
+    PRESETS, chart_png, changes_df, df_to_tasks, fairness_df,
+    parse_holidays, report_pdf, sample_df, summary, weekly_df
+)
 from deadline_balancer import Config, balance, make_chart
 from extract import COLUMNS, TYPES, read_tasks
-from study_features import (PRIORITY_VALUES, add_priority_columns, build_timetable,
-                            deadline_alerts, exam_preparation_plan, make_ics,
-                            progress_summary, study_recommendations)
-
-st.set_page_config(page_title="Deadline Balancer", page_icon="📅", layout="wide")
-
-
-def _start_balancing():
-    st.session_state["run"] = True
-
-
-def _append_task(row):
-    current = st.session_state.get("tasks", pd.DataFrame(columns=COLUMNS))
-    current = add_priority_columns(current, today)
-    st.session_state["tasks"] = pd.concat([current, pd.DataFrame([row])], ignore_index=True)
-    st.session_state["editor_v"] += 1
-
-
-# ------------------------------------------------------------------ sidebar
-with st.sidebar:
-    st.header("⚙️ Settings")
-    st.caption("Tell us how much you can handle. We'll only move deadlines "
-               "when your workload is too high.")
-
-    level = st.radio(
-        "How much work can you handle?",
-        ["Light", "Normal", "Heavy", "Custom"], index=1, horizontal=True,
-        help="Light ≈ 3 h a day, Normal ≈ 5 h a day, Heavy ≈ 7 h a day. "
-             "Pick Custom to set your own numbers.")
-    if level == "Custom":
-        weekday = st.number_input("Hours you can study on a weekday", 1.0, 16.0, 5.0, 0.5)
-        weekend = st.number_input("Hours you can study on a weekend day", 0.0, 16.0, 3.0, 0.5)
-        weekly = st.number_input("Most hours in one week", 5.0, 100.0, 28.0, 1.0)
-    else:
-        weekday, weekend, weekly = PRESETS[level]
-        st.caption(f"≈ {weekday:g} h on weekdays · {weekend:g} h on weekends · {weekly:g} h a week")
-
-    st.divider()
-    fair = st.toggle("Share delays fairly between subjects", value=True,
-                     help="On: no single teacher's deadlines get pushed again and again. "
-                          "Off: we just pick whatever needs the fewest total days of delay.")
-    no_weekend = st.toggle("Never move a deadline onto a weekend", value=True)
-
-    holidays_text = st.text_input(
-        "Holidays or exam days (deadlines can't land here)",
-        placeholder="e.g. 2026-11-01, 2026-11-14",
-        help="Type dates as YYYY-MM-DD, separated by commas.")
-    blackout, bad = parse_holidays(holidays_text)
-    if bad:
-        st.warning("Couldn't read: " + ", ".join(bad) + ". Use the form 2026-11-14.")
-
-    with st.expander("More options"):
-        today = st.date_input("Today's date", value=date.today(),
-                              help="Only tasks due today or later are used.")
-        cap_on = st.toggle("Set a last allowed date", value=False,
-                           help="No deadline will be pushed past this date (for example, end of term).")
-        horizon = st.date_input("Last allowed date", value=today + timedelta(30)) if cap_on else None
-
-cfg = Config(today, weekday, weekend, weekly, 0.5 if fair else 0.0, no_weekend, blackout, horizon)
-
-# ------------------------------------------------------------------ header
-left, right = st.columns([3, 1], vertical_alignment="center")
-with left:
-    st.title("📅 Deadline Balancer")
-    st.caption("Add your tasks, press the button, and get the smallest deadline changes "
-               "that keep your workload fair.")
-with right:
-    st.button("⚖️ Balance my deadlines", type="primary", width="stretch",
-              on_click=_start_balancing, key="balance_btn")
-
-# ------------------------------------------------------------------ step 1: tasks
-st.subheader("1 · Your tasks")
-st.session_state.setdefault("tasks", add_priority_columns(sample_df(today), today))
-st.session_state.setdefault("editor_v", 0)
-st.session_state.setdefault("seen_file", None)
-
-# Manual task entry is additive; the original editable table remains available below.
-with st.expander("➕ Add a task manually", expanded=False):
-    with st.form("manual_task_form", clear_on_submit=True):
-        mc1, mc2 = st.columns(2)
-        subject = mc1.text_input("Subject", placeholder="Mathematics")
-        title = mc2.text_input("Task title", placeholder="Assignment 3")
-        mc3, mc4, mc5 = st.columns(3)
-        kind = mc3.selectbox("Task type", TYPES)
-        effort = mc4.number_input("Estimated hours", min_value=0.5, max_value=200.0, value=4.0, step=0.5)
-        due = mc5.date_input("Due date", value=today + timedelta(days=7))
-        mc6, mc7 = st.columns(2)
-        priority = mc6.selectbox("Priority", PRIORITY_VALUES, index=1)
-        fixed = mc7.checkbox("Deadline cannot move", value=kind in ("quiz", "exam"))
-        add_clicked = st.form_submit_button("Add task", type="primary")
-        if add_clicked:
-            if not title.strip():
-                st.error("Enter a task title before adding it.")
-            else:
-                _append_task({"subject": subject.strip() or "General", "title": title.strip(),
-                              "type": kind, "effort_hours": effort, "deadline": due,
-                              "start": None, "fixed": fixed, "max_shift_days": None,
-                              "priority": priority, "completed_hours": 0.0, "status": "Not started"})
-                st.success("Task added. You can edit it in the task table below.")
-
-up = st.file_uploader(
-    "Upload your task list — CSV, DOCX, PDF, PNG/JPG/WEBP, or TXT/MD",
-    type=["csv", "docx", "pdf", "png", "jpg", "jpeg", "webp", "txt", "md"],
-    help="Imports are processed locally. Tables and dated task lines are supported; OCR is used for images and scanned PDFs. Review the extracted rows.")
-if up is not None and st.session_state["seen_file"] != up.file_id:
-    st.session_state["seen_file"] = up.file_id
-    try:
-        with st.spinner("Reading your file…"):
-            df, notes = read_tasks(up.getvalue(), up.name, today)
-        st.session_state["tasks"] = add_priority_columns(df, today)
-        st.session_state["editor_v"] += 1
-        st.session_state["notes"] = (f"Found {len(df)} task(s) in {up.name}.", notes)
-    except ValueError as e:
-        st.session_state["notes"] = None
-        st.error(str(e))
-
-if st.session_state.get("notes"):
-    head, notes = st.session_state["notes"]
-    st.success(head + " Check the table below, fix anything that looks wrong, then press "
-               "**Balance my deadlines**.")
-    for n in notes:
-        st.warning(n)
-
-c1, c2 = st.columns([1, 4])
-if c1.button("Use sample tasks", help="Replace the table with example tasks"):
-    st.session_state["tasks"] = sample_df(today)
-    st.session_state["editor_v"] += 1
-    st.session_state["notes"] = None
-    st.rerun()
-c2.caption("Double-click a cell to edit. Use the ＋ row at the bottom to add a task. "
-           "Track priority and completed hours here. Quizzes and exams never move.")
-
-edited = st.data_editor(
-    st.session_state["tasks"],
-    key=f"editor_{st.session_state['editor_v']}",
-    num_rows="dynamic",
-    width="stretch",
-    hide_index=True,
-    column_order=["subject", "title", "type", "effort_hours", "deadline", "priority", "completed_hours", "status", "fixed", "start", "max_shift_days"],
-    column_config={
-        "subject": st.column_config.TextColumn("Subject"),
-        "title": st.column_config.TextColumn("Task"),
-        "type": st.column_config.SelectboxColumn("Type", options=TYPES, default="assignment"),
-        "effort_hours": st.column_config.NumberColumn(
-            "Hours of work", min_value=0.5, max_value=200.0, step=0.5, default=4.0,
-            help="Your estimate of the total time this will take."),
-        "deadline": st.column_config.DateColumn("Due date", format="DD MMM YYYY"),
-        "priority": st.column_config.SelectboxColumn("Priority", options=PRIORITY_VALUES, default="Medium"),
-        "completed_hours": st.column_config.NumberColumn("Completed hours", min_value=0.0, max_value=200.0, step=0.5, default=0.0),
-        "status": st.column_config.SelectboxColumn("Progress", options=["Not started", "In progress", "Completed"], default="Not started"),
-        "fixed": st.column_config.CheckboxColumn(
-            "Can't move", default=False, help="Tick if this deadline is not negotiable."),
-        "start": st.column_config.DateColumn(
-            "Start date", format="DD MMM YYYY", help="Optional. When you can begin; "
-            "leave empty and we'll guess from the task type."),
-        "max_shift_days": st.column_config.NumberColumn(
-            "Max delay (days)", min_value=0, max_value=60, step=1,
-            help="Optional. The most this deadline may be pushed back."),
-    },
+from study_features import (
+    PRIORITY_VALUES, add_priority_columns, build_timetable,
+    deadline_alerts, exam_preparation_plan, make_ics,
+    progress_summary, study_recommendations
+)
+from assignment_tracker import (
+    load_assignments, save_assignment, delete_assignment, replace_all
 )
 
-# ------------------------------------------------------------------ progress, alerts and study tools
-# These additions use the existing task table; the deadline-balancing engine below is untouched.
-feature_tasks = add_priority_columns(edited, today)
-st.session_state["tasks"] = feature_tasks
-progress = progress_summary(feature_tasks)
+st.set_page_config(
+    page_title="Deadline Balancer",
+    page_icon="📅",
+    layout="wide"
+)
 
-st.subheader("Study progress and alerts")
-p1, p2, p3 = st.columns(3)
-p1.metric("Overall progress", f"{progress['percent']:.1f}%")
-p2.metric("Completed tasks", f"{progress['done']} / {progress['total']}")
-p3.metric("Hours remaining", f"{max(progress['planned'] - progress['completed'], 0):.1f} h")
-st.progress(min(progress["percent"] / 100, 1.0))
+st.markdown("""
+<style>
+.block-container {
+    padding-top: 1.5rem;
+    padding-bottom: 2rem;
+}
+[data-testid="stSidebar"] {
+    border-right: 1px solid rgba(128,128,128,.18);
+}
+.db-hero {
+    padding: 1.1rem 1.35rem;
+    border-radius: 16px;
+    background: linear-gradient(110deg,#1d4ed8,#2563eb);
+    color: white;
+    margin-bottom: 1rem;
+}
+.db-hero h1 {
+    color: white;
+    margin: 0;
+}
+.db-muted {
+    color: rgba(255,255,255,.85);
+}
+</style>
+""", unsafe_allow_html=True)
 
-alerts = deadline_alerts(feature_tasks, today, 7)
-if alerts.empty:
-    st.success("No unfinished tasks are due in the next 7 days.")
-else:
-    st.warning("Upcoming deadlines — review these tasks.")
-    st.dataframe(alerts, hide_index=True, width="stretch")
+TODAY = date.today()
 
-with st.expander("📚 Automatic timetable and personalized recommendations", expanded=False):
-    timetable = build_timetable(feature_tasks, today, weekday, weekend, 21)
-    if timetable.empty:
-        st.info("Add tasks with future due dates and remaining hours to generate a timetable.")
+st.session_state.setdefault(
+    "tasks",
+    add_priority_columns(sample_df(TODAY), TODAY)
+)
+st.session_state.setdefault("run", False)
+st.session_state.setdefault("balanced_result", None)
+st.session_state.setdefault("page", "Overview")
+
+PAGES = [
+    "Overview",
+    "My Tasks",
+    "Deadline Balancer",
+    "Study Planner",
+    "Exam Preparation",
+    "Assignment Tracker",
+    "Progress & Analytics",
+    "Settings"
+]
+
+# SIDEBAR NAVIGATION
+with st.sidebar:
+    st.markdown("## 📅 Deadline Balancer")
+
+    page = st.radio(
+        "WORKSPACE",
+        PAGES,
+        key="page",
+        label_visibility="collapsed"
+    )
+
+    st.divider()
+    st.caption("B.Tech Student Workspace")
+    st.caption("Organize • Plan • Submit • Track")
+
+
+# SHARED SETTINGS
+if "daily_cap" not in st.session_state:
+    (
+        st.session_state.daily_cap,
+        st.session_state.weekend_cap,
+        st.session_state.weekly_cap
+    ) = PRESETS["Normal"]
+
+if "fairness" not in st.session_state:
+    st.session_state.fairness = True
+
+if "no_weekend" not in st.session_state:
+    st.session_state.no_weekend = True
+
+if "holidays" not in st.session_state:
+    st.session_state.holidays = ""
+
+if "horizon_on" not in st.session_state:
+    st.session_state.horizon_on = False
+
+if "horizon_end" not in st.session_state:
+    st.session_state.horizon_end = TODAY + timedelta(days=30)
+
+
+st.markdown("""
+<div class="db-hero">
+    <h1>📅 Deadline Balancer</h1>
+    <div class="db-muted">
+        Your academic command centre — tasks, deadlines,
+        assignments and study progress.
+    </div>
+</div>
+""", unsafe_allow_html=True)
+
+
+# ==========================================================
+# 1. OVERVIEW
+# ==========================================================
+
+if page == "Overview":
+
+    st.title("Overview")
+    st.caption(
+        "A quick look at your semester workload and submission progress."
+    )
+
+    tasks_df = add_priority_columns(st.session_state.tasks, TODAY)
+    p = progress_summary(tasks_df)
+
+    a = load_assignments()
+
+    total_req = len(a)
+
+    submitted = (
+        int((a.status == "Submitted").sum())
+        if total_req else 0
+    )
+
+    pending = (
+        int((a.status == "Pending").sum())
+        if total_req else 0
+    )
+
+    late = (
+        int((a.status == "Late").sum())
+        if total_req else 0
+    )
+
+    c = st.columns(4)
+
+    c[0].metric("Academic tasks", len(tasks_df))
+    c[1].metric("Study progress", f"{p['percent']:.0f}%")
+    c[2].metric(
+        "Assignments submitted",
+        f"{submitted}/{total_req}"
+    )
+    c[3].metric("Pending submissions", pending + late)
+
+    st.progress(min(p["percent"] / 100, 1.0))
+
+    st.subheader("Upcoming deadlines")
+
+    upcoming = deadline_alerts(tasks_df, TODAY, 7)
+
+    if upcoming.empty:
+        st.success("No task deadlines in the next 7 days.")
     else:
-        st.dataframe(timetable, hide_index=True, width="stretch")
-        st.download_button("Download timetable CSV", timetable.to_csv(index=False).encode("utf-8"),
-                           "study_timetable.csv", "text/csv")
-        st.download_button("Add timetable to calendar (.ics)", make_ics(timetable).encode("utf-8"),
-                           "study_timetable.ics", "text/calendar")
-    st.markdown("**Study recommendations**")
-    for tip in study_recommendations(feature_tasks, today):
+        st.dataframe(
+            upcoming,
+            use_container_width=True,
+            hide_index=True
+        )
+
+    st.caption(
+        "Use the left sidebar to open My Tasks, Deadline Balancer, "
+        "Study Planner, Exam Preparation, Assignment Tracker, "
+        "Analytics or Settings."
+    )
+
+
+# ==========================================================
+# 2. MY TASKS
+# ==========================================================
+
+elif page == "My Tasks":
+
+    st.title("📚 My Tasks")
+
+    st.caption(
+        "Add, import and manage assignments, quizzes, labs, "
+        "projects and other academic work."
+    )
+
+    with st.expander("Add a task manually", expanded=True):
+
+        with st.form("add_task_form", clear_on_submit=True):
+
+            x1, x2, x3 = st.columns(3)
+
+            subject = x1.text_input("Subject")
+            title = x2.text_input("Task title")
+            kind = x3.selectbox("Type", TYPES)
+
+            x4, x5, x6 = st.columns(3)
+
+            hours = x4.number_input(
+                "Estimated hours", 0.5, 200.0, 4.0, 0.5
+            )
+
+            due = x5.date_input(
+                "Due date",
+                TODAY + timedelta(days=7)
+            )
+
+            priority = x6.selectbox(
+                "Priority",
+                PRIORITY_VALUES,
+                index=1
+            )
+
+            fixed = st.checkbox(
+                "Deadline cannot move",
+                value=kind in ("quiz", "exam")
+            )
+
+            if st.form_submit_button("Add task", type="primary"):
+
+                if not title.strip():
+                    st.error("Enter a task title.")
+
+                else:
+                    row = {
+                        "subject": subject.strip() or "General",
+                        "title": title.strip(),
+                        "type": kind,
+                        "effort_hours": hours,
+                        "deadline": due,
+                        "start": None,
+                        "fixed": fixed,
+                        "max_shift_days": None,
+                        "priority": priority,
+                        "completed_hours": 0.0,
+                        "status": "Not started"
+                    }
+
+                    st.session_state.tasks = pd.concat(
+                        [
+                            st.session_state.tasks,
+                            pd.DataFrame([row])
+                        ],
+                        ignore_index=True
+                    )
+
+                    st.success("Task added.")
+
+    uploaded = st.file_uploader(
+        "Import tasks (CSV, DOCX, PDF, PNG/JPG/WEBP, TXT/MD)",
+        type=[
+            "csv", "docx", "pdf", "png",
+            "jpg", "jpeg", "webp", "txt", "md"
+        ],
+        key="task_upload"
+    )
+
+    if uploaded and st.button("Import uploaded file"):
+
+        try:
+            df, notes = read_tasks(
+                uploaded.getvalue(),
+                uploaded.name,
+                TODAY
+            )
+
+            st.session_state.tasks = add_priority_columns(
+                df, TODAY
+            )
+
+            st.success(
+                f"Imported {len(df)} tasks. Review the table below."
+            )
+
+            for note in notes:
+                st.info(note)
+
+        except Exception as e:
+            st.error(str(e))
+
+    st.subheader("Your task list")
+
+    tasks = add_priority_columns(
+        st.session_state.tasks,
+        TODAY
+    )
+
+    edited = st.data_editor(
+        tasks,
+        num_rows="dynamic",
+        use_container_width=True,
+        hide_index=True,
+        column_config={
+            "type": st.column_config.SelectboxColumn(
+                options=TYPES
+            ),
+            "priority": st.column_config.SelectboxColumn(
+                options=PRIORITY_VALUES
+            ),
+            "status": st.column_config.SelectboxColumn(
+                options=[
+                    "Not started",
+                    "In progress",
+                    "Completed"
+                ]
+            ),
+            "deadline": st.column_config.DateColumn(
+                format="DD MMM YYYY"
+            )
+        },
+        key="tasks_editor"
+    )
+
+    st.session_state.tasks = edited
+
+    st.download_button(
+        "Download task list CSV",
+        edited.to_csv(index=False).encode(),
+        "my_tasks.csv",
+        "text/csv"
+    )
+
+
+# ==========================================================
+# 3. SETTINGS
+# ==========================================================
+
+elif page == "Settings":
+
+    st.title("⚙️ Study & balancing settings")
+
+    st.caption(
+        "Configure your available study hours and deadline restrictions here."
+    )
+
+    level = st.radio(
+        "Workload preset",
+        ["Light", "Normal", "Heavy", "Custom"],
+        index=1,
+        horizontal=True
+    )
+
+    if level == "Custom":
+
+        st.session_state.daily_cap = st.number_input(
+            "Weekday hours",
+            1.0, 16.0,
+            float(st.session_state.daily_cap),
+            0.5
+        )
+
+        st.session_state.weekend_cap = st.number_input(
+            "Weekend hours",
+            0.0, 16.0,
+            float(st.session_state.weekend_cap),
+            0.5
+        )
+
+        st.session_state.weekly_cap = st.number_input(
+            "Weekly hours",
+            5.0, 100.0,
+            float(st.session_state.weekly_cap),
+            1.0
+        )
+
+    else:
+
+        (
+            st.session_state.daily_cap,
+            st.session_state.weekend_cap,
+            st.session_state.weekly_cap
+        ) = PRESETS[level]
+
+        st.info(
+            f"{st.session_state.daily_cap:g} h weekdays · "
+            f"{st.session_state.weekend_cap:g} h weekends · "
+            f"{st.session_state.weekly_cap:g} h/week"
+        )
+
+    st.session_state.fairness = st.toggle(
+        "Share deadline delays fairly between subjects",
+        st.session_state.fairness
+    )
+
+    st.session_state.no_weekend = st.toggle(
+        "Never move deadlines onto weekends",
+        st.session_state.no_weekend
+    )
+
+    st.session_state.holidays = st.text_input(
+        "Holidays / exam days (YYYY-MM-DD, comma separated)",
+        st.session_state.holidays
+    )
+
+    st.session_state.horizon_on = st.toggle(
+        "Set last allowed deadline date",
+        st.session_state.horizon_on
+    )
+
+    if st.session_state.horizon_on:
+
+        st.session_state.horizon_end = st.date_input(
+            "Last allowed date",
+            st.session_state.horizon_end
+        )
+
+
+# ==========================================================
+# 4. DEADLINE BALANCER
+# ==========================================================
+
+elif page == "Deadline Balancer":
+
+    st.title("⚖️ Deadline Balancer")
+
+    st.caption(
+        "The original greedy + prune balancing algorithm is retained."
+    )
+
+    blackout, bad = parse_holidays(
+        st.session_state.holidays
+    )
+
+    if bad:
+        st.warning(
+            "Unrecognized dates: " + ", ".join(bad)
+        )
+
+    cfg = Config(
+        TODAY,
+        st.session_state.daily_cap,
+        st.session_state.weekend_cap,
+        st.session_state.weekly_cap,
+        0.5 if st.session_state.fairness else 0.0,
+        st.session_state.no_weekend,
+        blackout,
+        st.session_state.horizon_end
+        if st.session_state.horizon_on else None
+    )
+
+    st.write(
+        f"Capacity: **{cfg.daily_cap:g} h/day**, "
+        f"**{cfg.weekend_cap:g} h/weekend**, "
+        f"**{cfg.weekly_cap:g} h/week**"
+    )
+
+    st.dataframe(
+        st.session_state.tasks[
+            [
+                "subject", "title", "type",
+                "effort_hours", "deadline", "fixed"
+            ]
+        ],
+        use_container_width=True,
+        hide_index=True
+    )
+
+    if st.button(
+        "⚖️ Balance my deadlines",
+        type="primary"
+    ):
+
+        task_list, incomplete, past = df_to_tasks(
+            st.session_state.tasks,
+            TODAY
+        )
+
+        if not task_list:
+            st.error(
+                "Add tasks with future due dates and effort hours first."
+            )
+
+        else:
+
+            result = balance(task_list, cfg)
+
+            st.session_state.balanced_result = (
+                task_list, result, cfg
+            )
+
+            st.success(
+                f"Balancing complete. {incomplete} incomplete "
+                f"and {past} past-due rows skipped."
+            )
+
+    if st.session_state.balanced_result:
+
+        orig, new, cfg = st.session_state.balanced_result
+
+        s = summary(orig, new, cfg)
+
+        m = st.columns(3)
+
+        m[0].metric(
+            "Deadlines moved",
+            s["moved"]
+        )
+
+        m[1].metric(
+            "Total delay",
+            f"{s['delay']} days"
+        )
+
+        m[2].metric(
+            "Overload score",
+            f"{s['after']:.1f}",
+            delta=f"{s['after'] - s['before']:.1f}",
+            delta_color="inverse"
+        )
+
+        st.subheader("Suggested changes")
+
+        st.dataframe(
+            changes_df(new),
+            use_container_width=True,
+            hide_index=True
+        )
+
+        t1, t2, t3 = st.tabs(
+            ["Daily workload", "Weekly view", "Fairness"]
+        )
+
+        with t1:
+            st.pyplot(make_chart(orig, new, cfg))
+
+        with t2:
+            st.dataframe(
+                weekly_df(orig, new, cfg),
+                use_container_width=True,
+                hide_index=True
+            )
+
+        with t3:
+            st.bar_chart(fairness_df(new))
+
+        out = pd.DataFrame([
+            {
+                "Subject": t.subject,
+                "Task": t.title,
+                "Original due": t.original_deadline,
+                "New due": t.deadline,
+                "Delay days": t.shift
+            }
+            for t in new
+        ])
+
+        st.download_button(
+            "Download balanced deadlines CSV",
+            out.to_csv(index=False).encode(),
+            "balanced_deadlines.csv",
+            "text/csv"
+        )
+
+        st.download_button(
+            "Download PDF report",
+            report_pdf(orig, new, cfg),
+            "deadline_report.pdf",
+            "application/pdf"
+        )
+
+
+# ==========================================================
+# 5. STUDY PLANNER
+# ==========================================================
+
+elif page == "Study Planner":
+
+    st.title("🗓️ Study Planner")
+
+    timetable = build_timetable(
+        add_priority_columns(
+            st.session_state.tasks,
+            TODAY
+        ),
+        TODAY,
+        st.session_state.daily_cap,
+        st.session_state.weekend_cap,
+        30
+    )
+
+    if timetable.empty:
+
+        st.info(
+            "Add tasks with future due dates and remaining hours "
+            "to create your timetable."
+        )
+
+    else:
+
+        st.dataframe(
+            timetable,
+            use_container_width=True,
+            hide_index=True
+        )
+
+        st.download_button(
+            "Download timetable CSV",
+            timetable.to_csv(index=False).encode(),
+            "study_timetable.csv",
+            "text/csv"
+        )
+
+        st.download_button(
+            "Add sessions to calendar (.ics)",
+            make_ics(timetable).encode(),
+            "study_timetable.ics",
+            "text/calendar"
+        )
+
+    st.subheader("Study recommendations")
+
+    for tip in study_recommendations(
+        st.session_state.tasks,
+        TODAY
+    ):
         st.write("• " + tip)
 
-with st.expander("📝 Exam preparation mode", expanded=False):
-    ec1, ec2 = st.columns(2)
-    exam_subject = ec1.text_input("Exam subject", key="exam_subject")
-    exam_date = ec2.date_input("Exam date", value=today + timedelta(days=14), key="exam_date")
-    exam_hours = st.number_input("Study hours per day", min_value=0.5, max_value=12.0, value=2.0, step=0.5)
-    topics_text = st.text_area("Enter syllabus topics (one topic per line)", placeholder="Unit 1 - Basics\nUnit 2 - Applications")
-    if st.button("Generate exam preparation plan"):
-        topics = [line.strip() for line in topics_text.splitlines() if line.strip()]
-        if exam_date < today:
-            st.error("Choose an exam date today or in the future.")
+
+# ==========================================================
+# 6. EXAM PREPARATION
+# ==========================================================
+
+elif page == "Exam Preparation":
+
+    st.title("🎓 Exam Preparation")
+
+    with st.form("exam_plan_form"):
+
+        subject = st.text_input("Subject")
+
+        exam_date = st.date_input(
+            "Exam date",
+            TODAY + timedelta(days=14)
+        )
+
+        hours = st.number_input(
+            "Study hours per day",
+            0.5, 12.0, 2.0, 0.5
+        )
+
+        topics = st.text_area(
+            "Syllabus topics (one topic per line)",
+            placeholder="Unit 1 - Basics\nUnit 2 - Applications"
+        )
+
+        make = st.form_submit_button(
+            "Generate revision plan",
+            type="primary"
+        )
+
+    if make:
+
+        if exam_date < TODAY:
+
+            st.error("Exam date must be today or later.")
+
         else:
-            exam_plan = exam_preparation_plan(exam_subject.strip() or "Exam", exam_date,
-                                              exam_hours, today, topics)
-            st.dataframe(exam_plan, hide_index=True, width="stretch")
-            st.download_button("Download exam plan CSV", exam_plan.to_csv(index=False).encode("utf-8"),
-                               "exam_preparation_plan.csv", "text/csv")
 
-# ------------------------------------------------------------------ step 2: results
-st.subheader("2 · Results")
-if not st.session_state.get("run"):
-    st.info("Press **⚖️ Balance my deadlines** (top right) when your tasks look right.")
-    st.stop()
+            plan = exam_preparation_plan(
+                subject or "Exam",
+                exam_date,
+                hours,
+                TODAY,
+                [
+                    x.strip()
+                    for x in topics.splitlines()
+                    if x.strip()
+                ]
+            )
 
-tasks, incomplete, past = df_to_tasks(edited, today)
-if incomplete:
-    st.warning(f"{incomplete} row(s) are missing a due date or hours and were skipped.")
-if past:
-    st.warning(f"{past} task(s) are already past due and were skipped.")
-if not tasks:
-    st.error("There are no usable tasks yet. Add at least one task with a due date and hours.")
-    st.stop()
+            st.dataframe(
+                plan,
+                use_container_width=True,
+                hide_index=True
+            )
 
-new = balance(tasks, cfg)
-s = summary(tasks, new, cfg)
+            st.download_button(
+                "Download exam plan",
+                plan.to_csv(index=False).encode(),
+                "exam_plan.csv",
+                "text/csv"
+            )
 
-m1, m2, m3 = st.columns(3)
-m1.metric("Hours over your limit", f"{s['after']:.0f} h", delta=f"{s['after'] - s['before']:.0f} h",
-          delta_color="inverse",
-          help=f"Extra hours you'd have to work above your daily and weekly limits. "
-               f"{s['before']:.0f} h before balancing. Lower is better.")
-m2.metric("Deadlines moved", s["moved"])
-m3.metric("Total delay", f"{s['delay']} days")
 
-if s["days_before"] == 0 and s["weeks_after"] == 0:
-    st.success("Your workload is already within your limits — no changes needed. 🎉")
-elif s["days_after"] == 0 and s["weeks_after"] == 0:
-    st.success("Done. Every day and week is now within your limits.")
-else:
-    st.warning(
-        "We improved things as far as the rules allow, but some days are still too heavy. "
-        "Try raising **Max delay** on a task, choosing a heavier workload level, or removing "
-        "the last-allowed-date limit.")
+# ==========================================================
+# 7. B.TECH ASSIGNMENT TRACKER
+# ==========================================================
 
-tab1, tab2, tab3, tab4 = st.tabs(["Suggested changes", "Daily workload", "Weekly view", "Fairness"])
-with tab1:
-    ch = changes_df(new)
-    if ch.empty:
-        st.write("No deadlines need to move.")
+elif page == "Assignment Tracker":
+
+    st.title("📝 B.Tech Assignment Tracker")
+
+    st.caption(
+        "Record how many assignments each subject requires "
+        "and confirm every submission."
+    )
+
+    data = load_assignments()
+
+    total = len(data)
+
+    submitted = (
+        int((data.status == "Submitted").sum())
+        if total else 0
+    )
+
+    pending = (
+        int((data.status == "Pending").sum())
+        if total else 0
+    )
+
+    late = (
+        int((data.status == "Late").sum())
+        if total else 0
+    )
+
+    c = st.columns(4)
+
+    c[0].metric("Required entries", total)
+    c[1].metric("Submitted", submitted)
+    c[2].metric("Pending", pending)
+    c[3].metric("Late", late)
+
+    # ADD REQUIRED ASSIGNMENT
+    with st.expander(
+        "＋ Add required assignment",
+        expanded=True
+    ):
+
+        with st.form(
+            "assignment_add_form",
+            clear_on_submit=True
+        ):
+
+            a1, a2, a3 = st.columns(3)
+
+            semester = a1.selectbox(
+                "Semester",
+                [
+                    "1-1", "1-2",
+                    "2-1", "2-2",
+                    "3-1", "3-2",
+                    "4-1", "4-2"
+                ]
+            )
+
+            subject = a2.text_input(
+                "Subject name",
+                placeholder="Mathematics-II"
+            )
+
+            number = a3.text_input(
+                "Assignment number",
+                placeholder="1 / 2 / 3"
+            )
+
+            a4, a5 = st.columns(2)
+
+            title = a4.text_input(
+                "Assignment title (optional)"
+            )
+
+            due = a5.date_input(
+                "Due date",
+                value=TODAY + timedelta(days=7)
+            )
+
+            if st.form_submit_button(
+                "Add to required register",
+                type="primary"
+            ):
+
+                if not subject.strip() or not number.strip():
+
+                    st.error(
+                        "Subject and assignment number are required."
+                    )
+
+                else:
+
+                    try:
+
+                        save_assignment({
+                            "semester": semester,
+                            "subject": subject.strip(),
+                            "assignment_no": number.strip(),
+                            "title": title.strip(),
+                            "due_date": due.isoformat(),
+                            "status": "Pending",
+                            "submitted_date": "",
+                            "confirmation_note": ""
+                        })
+
+                        st.success(
+                            "Assignment added to your register."
+                        )
+
+                    except Exception as e:
+
+                        st.error(
+                            f"Could not save: {e}"
+                        )
+
+    # SUBMISSION CONFIRMATION TABLE
+    st.subheader("Submission confirmation register")
+
+    data = load_assignments()
+
+    if data.empty:
+
+        st.info(
+            "No assignments yet. Add the assignments your faculty "
+            "requires for each subject."
+        )
+
     else:
-        st.dataframe(ch, hide_index=True, width="stretch", column_config={
-            "Original due date": st.column_config.DateColumn(format="ddd DD MMM"),
-            "New due date": st.column_config.DateColumn(format="ddd DD MMM"),
-        })
-with tab2:
-    st.pyplot(make_chart(tasks, new, cfg))
-    st.caption("Bars above the dashed line are days that are too heavy.")
-with tab3:
-    st.dataframe(weekly_df(tasks, new, cfg), hide_index=True, width="stretch")
-with tab4:
-    st.caption("Days of delay given to each subject.")
-    st.bar_chart(fairness_df(new))
 
-st.subheader("Download")
-out = pd.DataFrame([dict(subject=t.subject, task=t.title, type=t.kind, hours=t.effort,
-                         original_due=t.original_deadline, new_due=t.deadline, delay_days=t.shift)
-                    for t in new])
-d1, d2, d3 = st.columns(3)
-d1.download_button("⬇️ Table (CSV)", out.to_csv(index=False).encode(), "balanced_deadlines.csv",
-                   "text/csv", width="stretch")
-d2.download_button("⬇️ Chart (PNG)", chart_png(tasks, new, cfg), "workload.png", "image/png",
-                   width="stretch")
-d3.download_button("⬇️ Report (PDF)", report_pdf(tasks, new, cfg), "deadline_report.pdf",
-                   "application/pdf", width="stretch")
+        editable = data.drop(
+            columns=["id"]
+        ).copy()
+
+        edited = st.data_editor(
+            editable,
+            use_container_width=True,
+            hide_index=True,
+            key="assignment_editor",
+            column_config={
+                "semester": st.column_config.SelectboxColumn(
+                    options=[
+                        "1-1", "1-2",
+                        "2-1", "2-2",
+                        "3-1", "3-2",
+                        "4-1", "4-2"
+                    ]
+                ),
+
+                "status": st.column_config.SelectboxColumn(
+                    options=[
+                        "Pending",
+                        "Submitted",
+                        "Late",
+                        "Not required"
+                    ]
+                ),
+
+                "due_date": st.column_config.TextColumn(
+                    "Due date (YYYY-MM-DD)"
+                ),
+
+                "submitted_date": st.column_config.TextColumn(
+                    "Submitted date (YYYY-MM-DD)"
+                ),
+
+                "confirmation_note": st.column_config.TextColumn(
+                    "Receipt / confirmation note"
+                )
+            }
+        )
+
+        if st.button(
+            "Save submission confirmations",
+            type="primary"
+        ):
+
+            replace_all(edited)
+
+            st.success(
+                "Assignment register saved."
+            )
+
+            st.rerun()
+
+        st.download_button(
+            "Export assignment register CSV",
+            data.to_csv(index=False).encode(),
+            "btech_assignment_register.csv",
+            "text/csv"
+        )
+
+        remove_id = st.selectbox(
+            "Delete an assignment record",
+            data.id.tolist(),
+            format_func=lambda x: (
+                f"Record {x}: "
+                f"{data.loc[data.id == x, 'subject'].iloc[0]} "
+                f"— Assignment "
+                f"{data.loc[data.id == x, 'assignment_no'].iloc[0]}"
+            )
+        )
+
+        if st.button("Delete selected record"):
+
+            delete_assignment(remove_id)
+
+            st.rerun()
+
+    st.info(
+        "Tip: enter the required assignment count given by your faculty. "
+        "The tracker does not assume a universal B.Tech assignment count."
+    )
+
+
+# ==========================================================
+# 8. PROGRESS & ANALYTICS
+# ==========================================================
+
+elif page == "Progress & Analytics":
+
+    st.title("📊 Progress & Analytics")
+
+    data = add_priority_columns(
+        st.session_state.tasks,
+        TODAY
+    )
+
+    p = progress_summary(data)
+
+    c = st.columns(4)
+
+    c[0].metric(
+        "Total tasks",
+        p["total"]
+    )
+
+    c[1].metric(
+        "Completed tasks",
+        p["done"]
+    )
+
+    c[2].metric(
+        "Progress",
+        f"{p['percent']:.1f}%"
+    )
+
+    c[3].metric(
+        "Hours completed",
+        f"{p['completed']:.1f}"
+    )
+
+    st.progress(
+        min(p["percent"] / 100, 1.0)
+    )
+
+    if not data.empty:
+
+        st.subheader("Tasks by subject")
+
+        st.bar_chart(
+            data.groupby("subject")["effort_hours"].sum()
+        )
+
+        st.subheader("Task status")
+
+        st.bar_chart(
+            data["status"].value_counts()
+        )
+
+    assignments = load_assignments()
+
+    if not assignments.empty:
+
+        st.subheader("Assignment submissions by status")
+
+        st.bar_chart(
+            assignments["status"].value_counts()
+        )
